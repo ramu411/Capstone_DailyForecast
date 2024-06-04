@@ -1,0 +1,1122 @@
+---
+title: "Call Center Daily Forecast - HarvardX Capstone Project"
+author: "Yuko Hayakawa"
+date: "2024-05-03"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    dev: cairo_pdf
+    fig_width: 24
+    fig_height: 18
+  html_document:
+    df_print: paged
+    code_folding: hide
+    toc: true
+    toc_depth: 3
+knit:
+  opts_chunk:
+    screenshot.force: webshot2
+    message: FALSE
+    warning: FALSE
+documentclass: bxjsarticle
+classoption: xelatex
+geometry: false
+fontsize: 9pt
+---
+
+```{r setup, include=FALSE, warning=FALSE, message=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+
+This project is a daily order forecasting project for a company's call center. In order to determine the staffing of the call center, a daily forecast of telephone orders received is required. The order data is recorded in US time, so must be converted to Japan time, taking into account business days and Japanese holidays.
+
+# Method and Analysis
+
+The orders received by phone is extracted from all orders received in the past three years, and the future is predicted based on various influencing factors. Since different customer types are affected differently, we will forecast the number of orders by customer types before the overall order forecast is made. Also, unpredictable system bugs and natural disasters can cause the number of orders to fluctuate widely back and forth, so we will like to proceed with a comprehensive look at MAE, MAPE, MASE, SMAPE, RMSE and RSQ as measure of accuracy.
+
+# Data Preparation
+
+## Install and Require Packages
+
+```{r, warning=FALSE, message=FALSE}
+# Load Libraries
+if(!require(webshot2)) install.packages("webshot2", repos = "http://cran.us.r-project.org")
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(lubridate)) install.packages("lubridate", repos = "http://cran.us.r-project.org")
+if(!require(gridExtra)) install.packages("gridExtra", repos = "http://cran.us.r-project.org")
+if(!require(timetk)) install.packages("timetk", repos = "http://cran.us.r-project.org")
+if(!require(reshape2)) install.packages("reshape2", repos = "https://cran.us.r-project.org")
+if(!require(Boruta)) install.packages("Boruta", repos = "https://cran.us.r-project.org")
+if(!require(imputeTS)) install.packages("imputeTS", repos = "https://cran.us.r-project.org")
+if(!require(modeltime)) install.packages("modeltime", repos = "https://cran.us.r-project.org")
+if(!require(parsnip)) install.packages("parsnip", repos = "https://cran.us.r-project.org")
+if(!require(recipes)) install.packages("recipes", repos = "https://cran.us.r-project.org")
+if(!require(workflows)) install.packages("workflows", repos = "https://cran.us.r-project.org")
+if(!require(readxl)) install.packages("readxl", repos = "https://cran.us.r-project.org")
+if(!require(rsample)) install.packages("rsample", repos = "https://cran.us.r-project.org")
+if(!require(glmnet)) install.packages("glmnet", repos = "https://cran.us.r-project.org")
+```
+
+Since purchase trends differ by membership type, forecasts shall be made for each type and finally synthesized to produce an overall purchase forecast.
+
+# Type-D Forecast
+
+First of all, we forecast a Type-D projection
+
+## Load Data and Data Preparation
+
+### Load Date Data
+
+This Date data includes dates from 1/1/2021 \~ 12/31/2024, as well as Japanese days of the week and national holidays.(The holiday is marked 7)
+
+```{r, warning=FALSE, message=FALSE}
+Date <- read.csv("data/Date.csv") %>%
+  mutate(Date = ymd(Date))
+head(Date)
+```
+
+### Load Order Data and Explor
+```{r, warning=FALSE, message=FALSE}
+# Load Customer Order Data
+order <- read.csv("data/Orders.csv") %>%
+  mutate(Date = ymd(Date))
+
+head(order)
+```
+
+### See Customer Type
+```{r}
+unique(order$customer_type)
+```
+
+### See Order Type
+```{r}
+unique(order$order_type)
+```
+
+### See Order Initial
+```{r}
+unique(order$init)
+```
+
+### See PV and Sales by customer type
+```{r}
+order %>%
+  group_by(customer_type) %>%
+  summarise(avg_pv = mean(pv),
+            avg_sales = mean(sales),
+            med_pv = median(pv),
+            med_sales = median(sales),
+            sd_pv = sd(pv),
+            sd_sales = sd(sales))
+```
+### See Distribution of Purchase
+```{r}
+order %>%
+  filter(pv > 0, pv < 500) %>%
+  ggplot(aes(pv, fill = customer_type, alpha = 0.5)) +
+  geom_density()
+```
+It is clear that different membership types have different purchase price zones and different order types.
+We see here that forecasts need to be made for each membership type.
+
+### See Number of Orders by Order and Customer Type
+```{r}
+order %>%
+  group_by(customer_type, order_type) %>%
+  summarise(order = n()) %>%
+  pivot_wider(names_from = customer_type,
+              values_from = order )
+```
+
+### Adjustment of Time Difference
+```{r, warning=FALSE, message=FALSE}
+# convert to Japanese time
+order <- order %>%
+  mutate(Date_us = as_datetime(paste(Date, time))) %>%
+  mutate(Date_jpn = as.Date(Date_us + hours(15)))
+
+order <- order %>%
+  select(Date_jpn, order_type, init, customer_type)
+
+names(order) <- c("Date", "order_type", "init", "customer_type")
+```
+
+### Create Type = "D" Data
+```{r, warning=FALSE, message=FALSE}
+# Create Order Data of "D" and summarize
+order_D <- order %>%
+  filter(customer_type == "D") %>%
+  group_by(Date) %>%
+  summarise(all = n())
+order_D$all <- as.numeric(order_D$all)
+
+# Create Telephone Order Data and summarize
+order_D_tel <- order %>%
+  filter(customer_type == "D",
+         !(init %in% c("*AS", "*WB"))) %>%
+  group_by(Date) %>%
+  summarise(tel = n())
+order_D_tel$tel <- as.numeric(order_D_tel$tel)
+
+# Left join
+order_D_tel <- left_join(order_D, order_D_tel, by = "Date")
+order_D_tel[is.na(order_D_tel)] <- 0
+
+head(order_D_tel)
+```
+
+### Weighting the days of the week
+
+Weight Telephone Orders only on business days, as they are heavily influenced by days of the week and holidays.
+
+```{r, warning=FALSE, message=FALSE}
+order_D_tel <- Date %>%
+  filter(Date <= "2023-12-31") %>%
+  left_join(order_D_tel, by = "Date")
+
+# Weighting
+order_D_weight <- order_D_tel %>%
+  group_by(dayofweek) %>%
+  summarise(tel = sum(tel))
+
+all <- sum(order_D_tel$all)
+
+order_D_weight <- order_D_weight %>%
+  mutate(percent = tel / all,
+         weight = round(percent * 100, 3))
+
+order_D_weight <- order_D_weight %>%
+  select(dayofweek, weight)
+
+order_D_weight
+```
+
+### Load Promotion Data
+
+Promotions and product launches also affect orders, so we will use this information as a predictor variable.
+
+```{r, warning=FALSE, message=FALSE}
+# Load Promotion Data and convert to integeres
+Promotion_D <- read.csv("data/Promotion.csv") %>%
+  mutate(Date = ymd(Date),
+         Project_A = as.integer(Project_A),
+         Project_B = as.integer(Project_B),
+         Promotion_1 = as.integer(Promotion_1),
+         Promotion_2 = as.integer(Promotion_2),
+         Promotion_3 = as.integer(Promotion_3),
+         Promotion_4 = as.integer(Promotion_4),
+         Promotion_5 = as.integer(Promotion_5),
+         Promotion_6 = as.integer(Promotion_6),
+         New_Product = as.integer(New_Product),
+         Reform_Product = as.integer(Reform_Product),
+         LTO_Launch = as.integer(LTO_Launch),
+         Event = as.integer(Event_Ticket)
+         ) %>%
+  select(-Event_Ticket)
+
+head(Promotion_D)
+```
+
+### Add Weight to Promotion Data
+
+```{r, warning=FALSE, message=FALSE}
+Promotion_D <- Promotion_D %>%
+  left_join(order_D_weight, by = "dayofweek")
+```
+
+### Left_join Promotion Data to Order Data
+
+```{r, warning=FALSE, message=FALSE}
+order_D_tel <- order_D_tel %>%
+  select(-dayofweek) %>%
+  left_join(Promotion_D, by = "Date")
+```
+
+## Exploratory Analysis Type-D
+
+### See the Head of Data
+
+```{r, warning=FALSE, message=FALSE}
+head(order_D_tel)
+```
+
+### See Numbers of Order by 1 person
+
+```{r, warning=FALSE, message=FALSE}
+order_by_init <- order %>%
+  filter(!(init %in% c("*AS", "*WB", ""))) %>%
+  group_by(Date, init) %>%
+  summarise(total_cases = n()) %>%
+  ungroup() %>%
+  group_by(init) %>%
+  summarise(
+    total_cases_per_day = mean(total_cases),
+   total_cases_per_init = sum(total_cases)
+  )
+order_by_init %>%
+  arrange(desc(total_cases_per_day))
+mean(order_by_init$total_cases_per_day)
+median(order_by_init$total_cases_per_day)
+```
+
+Average 7 cases, median 10 cases. Since the employee's company history is also a factor, we would like to use the top 10 employees as a guideline for forecasting accuracy. We think it would be reasonable if we could add 2-3 more employees to the shift, so we would like to have 15 x 3 = 45 employees --\> Final RMSE would be less than 50.
+
+### Confirm the Correlation
+
+```{r, warning=FALSE, message=FALSE}
+order_D_tel %>%
+  select(-Date) %>%
+  cor() %>%
+  round(2)
+```
+
+### Create Graph
+
+```{r, warning=FALSE, message=FALSE, fig.width=10, fig.height=4}
+order_D_tel %>%
+  ggplot(aes(Date, tel)) +
+  geom_line() +
+  geom_point() +
+  geom_smooth() +
+  labs(title = "Type=D Telephone Orders") +
+  theme_classic()
+```
+
+## Data Preparation for Forecast
+
+Create test and training data while preserving the temporal order of the data. Create and plot time-series re-sampling specifications (rset) for cross-validation purposes.
+
+```{r, warning=FALSE, message=FALSE, fig.width=10, fig.height=4}
+Splits_D <- initial_time_split(order_D_tel, prop = 0.85)
+
+Splits_D %>%
+  tk_time_series_cv_plan() %>%
+  plot_time_series_cv_plan(Date, tel,.interactive = TRUE)
+```
+
+## Model Pre-Processing
+
+Create a recipe specification for the training data using the recipe function. The target variable is the telephone order (tel), and the predictor variables used in the recipe are the explanatory variables that have an impact on telephone orders (tel) from the correlation coefficient.
+
+The following 7 patterns of Models are created to find the most accurate model.
+
+**Machine Learning (ML) Models**
+
+-   Elastic
+-   Random Forest
+-   Gradient Boost
+-   Prophet Boost Hybrid Model
+-   Arima Boost
+
+**NON ML Models**
+
+-   Exponential Smoothing
+-   Prophet
+
+### Create Recipe to make a Linear Model
+
+-   **receipe()** : Create a recipe
+
+-   **step_timeseries_signature(Date)** : Adds time series signature variables (e.g., year, month, day, week, quarter) based on the Date column.
+
+-   **step_rm(matches("(hour)\|(minute)\|(second)\|(am.pm)\|(xts)\|(iso)\|(lbl)"))**
+
+:   Removes variables that match the specified regular expressions. (unnecessary time-related variables)
+
+-   **step_zv(all_predictors())** : (Enable this function as needed) Remove zero-variance predictors (variables with constant values) from the recipe.
+
+-   **step_dummy(all_nominal_predictors(), one_hot = TRUE)** : Creates dummy variables (one-hot encoding) for all nominal categorical predictors in the recipe.
+
+```{r, warning=FALSE, message=FALSE}
+recipe_D <- recipe(tel ~ Date + dayofweek + Project_A + Promotion_1 + 
+                     Promotion_2 + Promotion_3 + Promotion_4 + Promotion_5 + 
+                     Promotion_6 + LTO_Launch + Event + weight, 
+                   training(Splits_D)) %>%
+  step_timeseries_signature(Date) %>%　
+  step_rm(matches("(hour)|(minute)|(second)|(am.pm)|(xts)|(iso)|(lbl)")) %>%
+  # step_zv(all_predictors()) %>% 
+  step_dummy(all_nominal_predictors(), one_hot = TRUE)
+```
+
+### Workflow to match those 7 Models
+
+ML Models
+
+```{r, warning=FALSE, message=FALSE}
+# Elastic Net
+fit_glmnet_D <- linear_reg(penalty = 0.1, mixture = 0.5) %>%
+  set_engine("glmnet")
+
+# Create workflow to access metadata about the currently running flow in Power Automate.
+# It is enabling you to build more robust and informative flows.
+fit_glmnet_D <- workflow() %>%
+  add_model(fit_glmnet_D) %>%
+  add_recipe(recipe_D %>% step_rm(Date)) %>%
+  fit(training(Splits_D))
+
+# Random Forest
+fit_rf_D<- workflow() %>%
+  add_model(rand_forest("regression") %>%
+              set_engine("ranger")) %>%
+  add_recipe(recipe_D %>% step_rm(Date)) %>%
+  fit(training(Splits_D))
+
+# Gradient Boost
+fit_xgb_D <- workflow() %>%
+  add_model(boost_tree("regression") %>% set_engine("xgboost")) %>%
+  add_recipe(recipe_D %>% step_rm(Date)) %>%
+  fit(training(Splits_D))
+
+# Prophet Boost Hybrid Model
+fit_prophet_boost_D <- workflow() %>%
+  add_model(prophet_boost("regression", seasonality_yearly = TRUE) %>% set_engine("prophet_xgboost")) %>%
+  add_recipe(recipe_D) %>%
+  fit(training(Splits_D))
+
+# Arima Boost
+fit_arima_boosted_D <- workflow() %>%
+  add_model(arima_boost("regression") %>% set_engine("auto_arima_xgboost")) %>%
+    add_recipe(recipe_D) %>%
+  fit(training(Splits_D))
+```
+
+Non ML Models
+
+```{r, warning=FALSE, message=FALSE}
+# Exponential Smoothing
+fit_ets_D <- workflow() %>%
+  add_model(exp_smoothing() %>% set_engine("ets")) %>%
+  add_recipe(recipe_D) %>%
+  fit(training(Splits_D))
+# Prophet
+fit_prophet_D <- workflow() %>%
+  add_model(prophet_reg() %>% set_engine("prophet")) %>%
+  add_recipe(recipe_D) %>%
+  fit(training(Splits_D))
+```
+
+Add fitted model to a Model Table
+
+```{r, warning=FALSE, message=FALSE}
+models_tbl_D <-
+  modeltime_table(
+    fit_glmnet_D,
+    fit_rf_D,
+    fit_xgb_D,
+    fit_prophet_boost_D,
+    fit_arima_boosted_D,
+    fit_ets_D,
+    fit_prophet_D
+  )
+
+rm(
+    fit_glmnet_D,
+    fit_rf_D,
+    fit_xgb_D,
+    fit_prophet_boost_D,
+    fit_arima_boosted_D,
+    fit_ets_D,
+    fit_prophet_D,
+    recipe_D
+)
+
+### Calibration
+calibration_table_D <- models_tbl_D %>%
+  modeltime_calibrate(new_data = testing(Splits_D))
+```
+
+### Plot those Models to Test Data
+
+```{r, warning=FALSE, message=FALSE, fig.width=24, fig.height=6}
+calibration_table_D %>%
+  modeltime_forecast(
+    new_data = testing(Splits_D),
+    actual_data = order_D_tel
+    ) %>%
+  plot_modeltime_forecast(.interactive = TRUE)
+```
+
+### Compare Accuracy
+
+```{r, warning=FALSE, message=FALSE, fig.width=24, fig.height=4}
+calibration_table_D %>%
+  modeltime_accuracy() %>%
+  table_modeltime_accuracy(
+    .interactive = FALSE
+  )
+```
+
+### Create a Recipe Specification for the Promotion Data
+
+```{r, warning=FALSE, message=FALSE}
+dates <- unique(order_D_tel$Date)
+`%ni%` <- Negate(`%in%`)
+
+Promotion_D <- Promotion_D %>% 
+  select(Date, Project_A, Promotion_1, Promotion_2, Promotion_3, Promotion_4, 
+         Promotion_5,Promotion_6, LTO_Launch, Event, weight, dayofweek) %>%
+  filter(Date %ni% dates)
+
+Promotion_D <- recipe(Project_A ~ Date + Promotion_1 + Promotion_2 + 
+                        Promotion_3 + Promotion_4 +Promotion_5 + Promotion_6 + 
+                        LTO_Launch + Event + weight + dayofweek, Promotion_D) %>%
+  step_timeseries_signature(Date) %>%
+  step_rm(matches("(hour)|(minute)|(second)|(am.pm)|(xts)|(iso)|(lbl)")) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) %>% 
+  prep() %>%
+  juice()
+
+head(Promotion_D)
+```
+
+### Choose the most Accuracy and Forecast
+
+If we are unsure about some accuracy, select multiple choices to choose the better result from the output data.
+
+```{r, warning=FALSE, message=FALSE, fig.width=10, fig.height=4}
+Forecast_D <- calibration_table_D %>%
+  filter(.model_id %in% c(2)) %>%
+  modeltime_refit(order_D_tel) %>%
+  modeltime_forecast(
+    # h = "5 months",
+    actual_data = order_D_tel,
+    new_data = Promotion_D
+  )
+
+Export_D <- Forecast_D %>%
+  filter(.model_desc != "ACTUAL") %>%
+  select(-.model_id, -.key) %>%
+  spread(key = .model_desc, value = .value) %>%
+  mutate(.index = ymd(.index))
+
+write_csv(Export_D, "forecast/type_D_forecast.csv")
+
+Forecast_D %>%
+  plot_modeltime_forecast(.interactive = FALSE)
+```
+
+# Type-W Forecast
+
+Next, we forecast a Type-W projection with same steps as Type-D.
+
+## Load Data and Data Preparation
+
+### Load Order Data and Create type ="W" Data
+
+```{r, warning=FALSE, message=FALSE}
+# Create Order Data of "W" and summarize
+order_W <- order %>%
+  filter(customer_type == "W") %>%
+  group_by(Date) %>%
+  summarise(all = n())
+order_W$all <- as.numeric(order_W$all)
+
+
+# Create Telephone Order Data and summarize
+order_W_tel <- order %>%
+  filter(customer_type == "W",
+         !(init %in% c("*AS", "*WB"))) %>%
+  group_by(Date) %>%
+  summarise(tel = n())
+order_W_tel$tel <- as.numeric(order_W_tel$tel)
+
+# Left join
+order_W_tel <- left_join(order_W, order_W_tel, by = "Date")
+order_W_tel[is.na(order_W_tel)] <- 0
+```
+
+### Weighting the days of the week
+
+```{r, warning=FALSE, message=FALSE}
+order_W_tel <- Date %>%
+  filter(Date <= "2023-12-31") %>%
+  left_join(order_W_tel, by = "Date")
+
+# Holiday
+order_W_weight <- order_W_tel %>%
+  group_by(dayofweek) %>%
+  summarise(tel = sum(tel))
+
+all <- sum(order_W_tel$all)
+
+order_W_weight <- order_W_weight %>%
+  mutate(percent = tel / all,
+         weight = round(percent * 100, 3))
+
+order_W_weight <- order_W_weight %>%
+  select(dayofweek, weight)
+
+order_W_weight
+```
+
+### Load Promotion Data
+
+```{r, warning=FALSE, message=FALSE}
+# Promotion Data
+Promotion_W <- read.csv("data/Promotion.csv") %>%
+  mutate(Date = ymd(Date),
+         Project_A = as.integer(Project_A),
+         Project_B = as.integer(Project_B),
+         Promotion_1 = as.integer(Promotion_1),
+         Promotion_2 = as.integer(Promotion_2),
+         Promotion_3 = as.integer(Promotion_3),
+         Promotion_4 = as.integer(Promotion_4),
+         Promotion_5 = as.integer(Promotion_5),
+         Promotion_6 = as.integer(Promotion_6),
+         New_Product = as.integer(New_Product),
+         Reform_Product = as.integer(Reform_Product),
+         LTO_Launch = as.integer(LTO_Launch),
+         Event = as.integer(Event_Ticket)
+         ) %>%
+  select(-Event_Ticket)
+```
+
+### Add Weight to Promotion Data
+
+```{r, warning=FALSE, message=FALSE}
+Promotion_W <- Promotion_W %>%
+  left_join(order_W_weight, by = "dayofweek")
+```
+
+### Left_join Promotion data to Order Data
+
+```{r, warning=FALSE, message=FALSE}
+order_W_tel <- order_W_tel %>%
+  select(-dayofweek) %>%
+  left_join(Promotion_W, by = "Date")
+```
+
+## Exploratory Analysis Type-W
+
+### See the Head of Data
+
+```{r, warning=FALSE, message=FALSE}
+head(order_W_tel)
+```
+
+### Confirm the Correlation
+
+```{r, warning=FALSE, message=FALSE}
+order_W_tel %>%
+  select(-Date) %>%
+  cor() %>%
+  round(2)
+```
+
+### Create Fraph
+
+```{r, warning=FALSE, message=FALSE, fig.width=10, fig.height=4}
+order_W_tel%>%
+  ggplot(aes(Date, tel)) +
+  geom_line() +
+  geom_point() +
+  geom_smooth() +
+  labs(title = "Type=W Telephone Orders") +
+  theme_classic()
+```
+
+## Data Preparation for Forecast
+
+```{r, warning=FALSE, message=FALSE, fig.width=10, fig.height=4}
+Splits_W <- initial_time_split(order_W_tel, prop = 0.85)
+
+Splits_W %>%
+  tk_time_series_cv_plan() %>%
+  plot_time_series_cv_plan(Date, tel,.interactive = TRUE)
+```
+
+## Model Pre-Processing
+
+### Create Recipe to make a Linear Model
+
+```{r, warning=FALSE, message=FALSE}
+recipe_W <- recipe(tel ~ Date + dayofweek + Project_A + Project_B + Promotion_1 +
+                     Promotion_2 + Promotion_3 + Promotion_4 + LTO_Launch + 
+                     Event + weight, training(Splits_W)) %>%
+  step_timeseries_signature(Date) %>%　
+  step_rm(matches("(hour)|(minute)|(second)|(am.pm)|(xts)|(iso)|(lbl)")) %>%
+  # step_zv(all_predictors()) %>% 
+  step_dummy(all_nominal_predictors(), one_hot = TRUE)
+
+###########################
+### ML Models
+# Elastic Net
+fit_glmnet_W <- linear_reg(penalty = 0.1, mixture = 0.5) %>%
+  set_engine("glmnet")
+fit_glmnet_W <- workflow() %>%
+  add_model(fit_glmnet_W) %>%
+  add_recipe(recipe_W %>% step_rm(Date)) %>%
+  fit(training(Splits_W))
+
+# Random Forest
+fit_rf_W<- workflow() %>%
+  add_model(rand_forest("regression") %>% set_engine("ranger")) %>%
+  add_recipe(recipe_W %>% step_rm(Date)) %>%
+  fit(training(Splits_W))
+
+# Gradient Boost
+fit_xgb_W <- workflow() %>%
+  add_model(boost_tree("regression") %>% set_engine("xgboost")) %>%
+  add_recipe(recipe_W %>% step_rm(Date)) %>%
+  fit(training(Splits_W))
+
+# Prophet Boost Hybrid Model
+fit_prophet_boost_W <- workflow() %>%
+  add_model(prophet_boost("regression", seasonality_yearly = TRUE) %>%
+              set_engine("prophet_xgboost")) %>%
+  add_recipe(recipe_W) %>%
+  fit(training(Splits_W))
+
+# Arima Boost
+fit_arima_boosted_W <- workflow() %>%
+  add_model(arima_boost("regression") %>% set_engine("auto_arima_xgboost")) %>%
+  add_recipe(recipe_W) %>%
+  fit(training(Splits_W))
+
+###########################
+### Non ML Models
+# Exponential Smoothing
+fit_ets_W <- workflow() %>%
+  add_model(exp_smoothing() %>% set_engine("ets")) %>%
+  add_recipe(recipe_W) %>%
+  fit(training(Splits_W))
+# Prophet
+fit_prophet_W <- workflow() %>%
+  add_model(prophet_reg() %>% set_engine("prophet")) %>%
+  add_recipe(recipe_W) %>%
+  fit(training(Splits_W))
+
+###########################
+### Add fitted model to a Model Table
+models_tbl_W <-
+  modeltime_table(
+    fit_glmnet_W,
+    fit_rf_W,
+    fit_xgb_W,
+    fit_prophet_boost_W,
+    fit_arima_boosted_W,
+    fit_ets_W,
+    fit_prophet_W
+  )
+###########################
+
+rm(
+    fit_glmnet_W,
+    fit_rf_W,
+    fit_xgb_W,
+    fit_prophet_boost_W,
+    fit_arima_boosted_W,
+    fit_ets_W,
+    fit_prophet_W,
+    recipe_W
+)
+
+### Calibration
+calibration_table_W <- models_tbl_W %>%
+  modeltime_calibrate(new_data = testing(Splits_W))
+```
+
+### Plot those Models to Test Data
+
+```{r, warning=FALSE, message=FALSE, fig.width=24, fig.height=6}
+calibration_table_W %>%
+  modeltime_forecast(
+    new_data = testing(Splits_W),
+    actual_data = order_W_tel
+    ) %>%
+  plot_modeltime_forecast(.interactive = TRUE)
+```
+
+### Compare Accuracy
+
+```{r, warning=FALSE, message=FALSE, fig.width=24, fig.height=4}
+calibration_table_W %>%
+  modeltime_accuracy() %>%
+  table_modeltime_accuracy(
+    .interactive = FALSE
+  )
+```
+
+### Create a Recipe Specification for the Promotion Data
+
+```{r, warning=FALSE, message=FALSE}
+dates <- unique(order_W_tel$Date)
+`%ni%` <- Negate(`%in%`)
+
+Promotion_W <- Promotion_W %>% 
+  select(Date, Project_A, Project_B, Promotion_1, Promotion_2, Promotion_3, 
+         Promotion_4, 
+         LTO_Launch, Event, weight, dayofweek) %>%
+  filter(Date %ni% dates)
+
+Promotion_W <- recipe(Project_A ~ Date + Project_B + Promotion_1 + Promotion_2 +
+                        Promotion_3 +
+                        Promotion_4 +  LTO_Launch + Event + weight + dayofweek, 
+                      Promotion_W) %>%
+  step_timeseries_signature(Date) %>%
+  step_rm(matches("(hour)|(minute)|(second)|(am.pm)|(xts)|(iso)|(lbl)")) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) %>% 
+  prep() %>%
+  juice()
+
+head(Promotion_W)
+```
+
+### Choose the most Accuracy and Forecast
+
+```{r, warning=FALSE, message=FALSE, fig.width=10, fig.height=4}
+Forecast_W <- calibration_table_W %>%
+  filter(.model_id %in% c(2)) %>%
+  modeltime_refit(order_W_tel) %>%
+  modeltime_forecast(
+    # h = "5 months",
+    actual_data = order_W_tel,
+    new_data = Promotion_W
+  )
+
+Export_W <- Forecast_W %>%
+  filter(.model_desc != "ACTUAL") %>%
+  select(-.model_id, -.key) %>%
+  spread(key = .model_desc, value = .value) %>%
+  mutate(.index = ymd(.index))
+
+write_csv(Export_W, "forecast/type_W_forecast.csv")
+
+Forecast_W %>%
+  plot_modeltime_forecast(.interactive = FALSE)
+```
+
+# All Types Forecast
+
+Finally, include Type-D and Type-W Forecasts in the predictor variables to Forecast the over all number of phone orders.
+
+## Load Data and Data Preparation
+
+### Load Forecast Data of Type-D and Type-W and Preparation
+
+If multiple accuracies are selected in the table, review the exported data and work to keep the more accurate data. Import the processed data again and use it for the overall forecast.
+
+```{r, warning=FALSE, message=FALSE}
+# Create Type-W Data using Telephone Orders of Type-D forecast
+Forecast_D <- read_csv("forecast/type_D_forecast.csv")
+
+Forecast_D <- Forecast_D[,c(1,4)]
+
+names(Forecast_D) <- c("Date", "tel")
+
+order_D_tel <- order_D_tel %>%
+  select(Date, tel)
+order_D_tel <- rbind(order_D_tel, Forecast_D)
+
+rm(Forecast_D)
+
+
+# Create Type-W Data using Telephone Orders of Type-W forecast
+Forecast_W <- read_csv("forecast/type_W_forecast.csv")
+
+Forecast_W <- Forecast_W[,c(1,4)]
+
+names(Forecast_W) <- c("Date", "tel")
+
+order_W_tel <- order_W_tel %>%
+  select(Date, tel)
+order_W <- rbind(order_W_tel, Forecast_W)
+
+rm(Forecast_W)
+```
+
+### Create Data for All Telephone Orders
+
+```{r, warning=FALSE, message=FALSE}
+# All Telephone Orders
+order_tel <- order %>%
+  select(Date, init) %>%
+  filter(!(init %in% c("*AS", "*WB")))
+
+order_tel <- order_tel %>%
+  group_by(Date) %>%
+  summarise(tel = n())
+
+order_tel$tel <- as.numeric(order_tel$tel)
+
+order_tel <- Date %>%
+  filter(Date <= "2023-12-31") %>%
+  select(Date) %>%
+  left_join(order_tel, by = "Date")
+order_tel[is.na(order_tel)] <- 0
+
+
+# All orders
+order_all <- order %>%
+  group_by(Date) %>%
+  summarise(all = n())
+
+order_tel <- order_all %>%
+  left_join(order_tel, by = "Date")
+```
+
+### Weighting the days of the week
+
+```{r, warning=FALSE, message=FALSE}
+order_tel <- Date %>%
+  filter(Date <= "2023-12-31") %>%
+  left_join(order_tel, by = "Date")
+
+# Holiday
+order_weight <- order_tel %>%
+  group_by(dayofweek) %>%
+  summarise(tel = sum(tel))
+
+all <- sum(order_tel$all)
+
+order_weight <- order_weight %>%
+  mutate(percent = tel / all,
+         weight = round(percent * 100, 3))
+
+order_weight <- order_weight %>%
+  select(dayofweek, weight)
+
+order_weight
+```
+
+### Load Promotion Data
+
+```{r, warning=FALSE, message=FALSE}
+# Promotion Data
+Promotion <- read.csv("data/Promotion.csv") %>%
+  mutate(Date = ymd(Date),
+         Project_A = as.integer(Project_A),
+         Project_B = as.integer(Project_B),
+         Promotion_1 = as.integer(Promotion_1),
+         Promotion_2 = as.integer(Promotion_2),
+         Promotion_3 = as.integer(Promotion_3),
+         Promotion_4 = as.integer(Promotion_4),
+         Promotion_5 = as.integer(Promotion_5),
+         Promotion_6 = as.integer(Promotion_6),
+         New_Product = as.integer(New_Product),
+         Reform_Product = as.integer(Reform_Product),
+         LTO_Launch = as.integer(LTO_Launch),
+         Event = as.integer(Event_Ticket)
+         ) %>%
+  select(-Event_Ticket)
+```
+
+### Add Weight to Promotion Data
+
+```{r, warning=FALSE, message=FALSE}
+Promotion <- Promotion %>%
+  left_join(order_weight, by = "dayofweek")
+```
+
+### Left_join Promotion Data to Order Data
+
+```{r, warning=FALSE, message=FALSE}
+order_tel <- order_tel %>%
+  select(-dayofweek) %>%
+  left_join(Promotion, by = "Date")
+```
+
+## Exploratory Analysis All
+
+### See the Head of Data
+
+```{r, warning=FALSE, message=FALSE}
+head(order_tel)
+```
+
+### Confirm the Correlation
+
+```{r, warning=FALSE, message=FALSE}
+order_tel %>%
+  select(-Date) %>%
+  cor() %>%
+  round(2)
+```
+
+### Create Fraph
+
+```{r, warning=FALSE, message=FALSE, fig.width=10, fig.height=4}
+order_tel %>%
+  ggplot(aes(Date, tel)) +
+  geom_line() +
+  geom_point() +
+  geom_smooth() +
+  labs(title = "All Telephone Orders") +
+  theme_classic()
+```
+
+## Data Preparation for Forecast
+
+```{r, warning=FALSE, message=FALSE, fig.width=10, fig.height=4}
+Splits <- initial_time_split(order_tel, prop = 0.85)
+
+Splits %>%
+  tk_time_series_cv_plan() %>%
+  plot_time_series_cv_plan(Date, tel,.interactive = TRUE)
+```
+
+## Model Pre-Processing
+
+### Create Recipe to make a Linear Model
+
+```{r, warning=FALSE, message=FALSE}
+recipe_spec <- recipe(tel ~ Date + dayofweek + Project_A + Promotion_1 + 
+                        Promotion_2 + Promotion_3 + Promotion_4 + Promotion_5 + 
+                        LTO_Launch + Event + weight, training(Splits)) %>%
+  step_timeseries_signature(Date) %>%　
+  step_rm(matches("(hour)|(minute)|(second)|(am.pm)|(xts)|(iso)|(lbl)")) %>%
+  # step_zv(all_predictors()) %>% 
+  step_dummy(all_nominal_predictors(), one_hot = TRUE)
+
+###########################
+### ML Models
+# Elastic Net
+fit_glmnet <- linear_reg(penalty = 0.1, mixture = 0.5) %>%
+  set_engine("glmnet")
+
+fit_glmnet <- workflow() %>%
+  add_model(fit_glmnet) %>%
+  add_recipe(recipe_spec %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Random Forest
+fit_rf<- workflow() %>%
+  add_model(rand_forest("regression") %>% set_engine("ranger")) %>%
+  add_recipe(recipe_spec %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Gradient Boost
+fit_xgb <- workflow() %>%
+  add_model(boost_tree("regression") %>% set_engine("xgboost")) %>%
+  add_recipe(recipe_spec %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Prophet Boost Hybrid Model
+fit_prophet_boost <- workflow() %>%
+  add_model(prophet_boost("regression", seasonality_yearly = TRUE) %>% set_engine("prophet_xgboost")) %>%
+  add_recipe(recipe_spec) %>%
+  fit(training(Splits))
+
+# Arima Boost
+fit_arima_boosted <- workflow() %>%
+  add_model(arima_boost("regression") %>% set_engine("auto_arima_xgboost")) %>%
+  add_recipe(recipe_spec) %>%
+  fit(training(Splits))
+
+###########################
+### Non ML Models
+# Exponential Smoothing
+fit_ets <- workflow() %>%
+  add_model(exp_smoothing() %>% set_engine("ets")) %>%
+  add_recipe(recipe_spec) %>%
+  fit(training(Splits))
+# Prophet
+fit_prophet <- workflow() %>%
+  add_model(prophet_reg() %>% set_engine("prophet")) %>%
+  add_recipe(recipe_spec) %>%
+  fit(training(Splits))
+
+###########################
+### Add fitted model to a Model Table
+models_tbl <-
+  modeltime_table(
+    fit_glmnet,
+    fit_rf,
+    fit_xgb,
+    fit_prophet_boost,
+    fit_arima_boosted,
+    fit_ets,
+    fit_prophet
+  )
+###########################
+
+rm(
+    fit_glmnet,
+    fit_rf,
+    fit_xgb,
+    fit_prophet_boost,
+    fit_arima_boosted,
+    fit_ets,
+    fit_prophet,
+    recipe_spec
+)
+
+### Calibration
+calibration_table <- models_tbl %>%
+  modeltime_calibrate(new_data = testing(Splits))
+```
+
+### Plot those Models to Test Data
+
+```{r, warning=FALSE, message=FALSE, fig.width=24, fig.height=6}
+calibration_table %>%
+  modeltime_forecast(
+    new_data = testing(Splits),
+    actual_data = order_tel
+    ) %>%
+  plot_modeltime_forecast(.interactive = TRUE)
+```
+
+### Compare Accuracy
+
+```{r, warning=FALSE, message=FALSE, fig.width=24, fig.height=4}
+calibration_table %>%
+  modeltime_accuracy() %>%
+  table_modeltime_accuracy(
+    .interactive = FALSE
+  )
+```
+
+### Create a Recipe specification for the Promotion Data
+
+```{r, warning=FALSE, message=FALSE}
+dates <- unique(order_tel$Date)
+`%ni%` <- Negate(`%in%`)
+
+Promotion <- Promotion %>% 
+  select(Date, Project_A, Promotion_1, Promotion_2, Promotion_3, Promotion_4, 
+         Promotion_5, LTO_Launch, Event, weight, dayofweek) %>%
+  filter(Date %ni% dates)
+
+Promotion <- recipe(Project_A ~ Date + Promotion_1 + Promotion_2 + Promotion_3 + 
+                      Promotion_4 + Promotion_5 + LTO_Launch + Event + weight + 
+                      dayofweek, Promotion) %>%
+  step_timeseries_signature(Date) %>%
+  step_rm(matches("(hour)|(minute)|(second)|(am.pm)|(xts)|(iso)|(lbl)")) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) %>% 
+  prep() %>%
+  juice()
+
+head(Promotion)
+```
+
+### Choose the most Accuracy and Forecast
+
+```{r, warning=FALSE, message=FALSE, fig.width=10, fig.height=4}
+Forecast <- calibration_table %>%
+  filter(.model_id %in% c(3)) %>%
+  modeltime_refit(order_tel) %>%
+  modeltime_forecast(
+    # h = "5 months",
+    actual_data = order_tel,
+    new_data = Promotion
+  )
+
+Export <- Forecast %>%
+  filter(.model_desc != "ACTUAL") %>%
+  select(-.model_id, -.key) %>%
+  spread(key = .model_desc, value = .value) %>%
+  mutate(.index = ymd(.index))
+
+write_csv(Export, "forecast/All Telephone Order_forecast.csv")
+
+Forecast %>%
+  plot_modeltime_forecast(.interactive = FALSE)
+```
+
+# Conclusion
+
+The market for this industry has been favorable for the Japanese market since Corona in 2020, and sales have been on the rise. Although online advertising has greatly promoted the market and increased the number of buyers, it seems that the influence of promotions alone is no longer highly accurate in predicting orders due to the manner in which promotions are launched. Unpredictable system errors may reduce accuracy because of the extreme increase in phone orders when online orders cannot be placed. In addition, due to the time difference with the U.S., the impact of promotion deadlines and system outages is significant, especially when switching to daylight saving time, which causes confusion, and including data on these factors may improve accuracy. One way to do this would be to also consider the impact of rising prices, falling stock prices, natural disasters, and a weakening yen. Ideally, we would like to list MAPE at 10% or less, RMSE at 10 for each type, and overall accuracy at 20 or less.
